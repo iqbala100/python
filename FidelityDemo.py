@@ -1,6 +1,6 @@
-print("This is first demo for python")
+print("This is first demo for pythonHHHHHHHHHHHHHH")
 
-a=10
+a=1000
 b=20
 c=a+b
 print(c)
