@@ -3,69 +3,207 @@ import re
 import shutil
 import hashlib
 import yaml
-from deepdiff import DeepDiff
+from typing import Any, Dict, List, Tuple, Optional
 
-# === Configure paths (use raw strings r"" on Windows) ===
+# ========== CONFIG ==========
+# Multiple input roots to scan recursively
 input_dirs = [
     r"C:\path\to\envA\.harness\services",
     r"C:\path\to\envB\.harness\services",
-    # add more roots as needed...
+    # add more roots if needed...
 ]
+
+# Single destination for matched files + report
 matching_common_folder = r"C:\path\to\yaml_matching_common"
 
-# === Behavior toggles ===
-# "exact": copy files only when YAMLs are identical (DeepDiff == empty, ignore_order=True)
-# "threshold": treat files as matching if their flattened (path,value) similarity >= SIMILARITY_THRESHOLD
-MATCH_MODE = "exact"         # choose: "exact" or "threshold"
-SIMILARITY_THRESHOLD = 0.90  # used only when MATCH_MODE == "threshold"
+# --- Metadata match rules (PRIMARY) ---
+REQUIRE_SAME_NAME = True          # require YAML 'name' equality
+REQUIRE_SAME_IDENTIFIER = True    # require YAML 'identifier' equality
 
-# Compare only files with the same base name across folders (reduces pair count)
-MATCH_BY_NAME = False
+# Tags matching mode:
+#   'any'     -> at least 1 tag in common
+#   'min'     -> at least TAGS_INTERSECT_MIN in common
+#   'subset'  -> tags of one file ⊆ tags of the other
+#   'exact'   -> sets equal (ignoring order)
+TAGS_MATCH_MODE = "any"
+TAGS_INTERSECT_MIN = 1            # used when TAGS_MATCH_MODE == 'min'
+TAGS_REQUIRED = False             # if True, both files must have non-empty tags to be considered
 
-# Preserve original subfolder structure (grouped by root label) inside the common folder.
-# If False, the destination is flat and file names are path-encoded with the root label.
+# Normalize comparisons
+CASE_INSENSITIVE_COMPARE = True   # lowercases name, identifier, tag keys/values
+
+# Where to look for fields inside YAML (first hit wins)
+FIELD_PATHS = {
+    "name":       ["service.name", "name", "metadata.name"],
+    "identifier": ["service.identifier", "identifier", "metadata.identifier", "id"],
+    "tags":       ["service.tags", "tags", "metadata.tags"]
+}
+
+# --- Optional content check (SECONDARY) ---
+# After metadata matches, optionally also require content similarity:
+ENABLE_CONTENT_CHECK = False      # set True to also check content with DeepDiff
+CONTENT_MODE = "exact"            # 'exact' or 'threshold'
+SIMILARITY_THRESHOLD = 0.90       # used when CONTENT_MODE == 'threshold'
+
+# Compare only files with the same base filename across roots (pre-filter)
+MATCH_BY_FILENAME = False
+
+# Mirror original subfolders grouped by root label in the common folder; else use flat, safe names
 PRESERVE_STRUCTURE = False
 
-# Empty destination folder before copying (keeps the folder itself)
+# Clear destination before copying
 CLEAN_DEST = False
 
-# Compare files within the same input root as well (default compares only across different roots)
+# Also compare files within the same input root (default False = cross-root only)
 INCLUDE_INTRA_ROOT = False
 
-# Write a single YAML with pairwise common values for matched pairs
-WRITE_COMMON_VALUES_REPORT = True
-COMMON_VALUES_REPORT_NAME = "common_values_report.yaml"
-# Limit the number of common entries stored per pair (to keep report manageable)
-MAX_COMMON_VALUES_PER_PAIR = 200
+# YAML report name
+REPORT_NAME = "matches_report.yaml"
+
+# Limit common-keys sample stored per pair to keep report small
+MAX_COMMON_SAMPLED = 200
+# ========== END CONFIG ==========
+
+# ---- Optional DeepDiff usage (only if ENABLE_CONTENT_CHECK is True) ----
+try:
+    from deepdiff import DeepDiff  # noqa
+except Exception:
+    if ENABLE_CONTENT_CHECK:
+        raise RuntimeError("DeepDiff required: pip install deepdiff")
 
 
-# ---------- helpers ----------
-
+# ================= helpers =================
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
-def list_yaml_files_recursively(root_dir: str):
+def list_yaml_files_recursively(root_dir: str) -> List[Tuple[str, str]]:
     files = []
     for root, _, filenames in os.walk(root_dir):
         for name in filenames:
             if name.lower().endswith((".yaml", ".yml")):
                 full = os.path.join(root, name)
-                rel  = os.path.relpath(full, root_dir)
-                files.append((full, rel))  # (absolute_path, relative_path)
+                rel = os.path.relpath(full, root_dir)
+                files.append((full, rel))
     return files
 
-def load_first_yaml_doc(path: str):
-    # Compare the first document if a file contains multiple docs separated by '---'
+def load_first_yaml_doc(path: str) -> Any:
     with open(path, "r", encoding="utf-8") as f:
         docs = list(yaml.safe_load_all(f))
         if not docs:
             return {}
         return docs[0] if docs[0] is not None else {}
 
+def get_by_path(obj: Any, dotted: str) -> Optional[Any]:
+    """
+    Traverse obj using dotted path like 'service.tags' or 'metadata.name'.
+    Supports simple dict keys; does not index lists for these fields.
+    """
+    cur = obj
+    for part in dotted.split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return None
+    return cur
+
+def find_first(obj: Any, paths: List[str]) -> Optional[Any]:
+    for p in paths:
+        v = get_by_path(obj, p)
+        if v is not None:
+            return v
+    return None
+
+def norm_str(v: Optional[str]) -> Optional[str]:
+    if v is None:
+        return None
+    v = str(v).strip()
+    return v.lower() if CASE_INSENSITIVE_COMPARE else v
+
+def normalize_tags(raw: Any) -> List[str]:
+    """
+    Return a list of normalized tags as 'key=value' or single token.
+    Accepts:
+      - dict: {"k":"v", "team":"EDO"}
+      - list[str]: ["EDO", "backend"]
+      - list[dict]: [{"k":"v"}, {"team":"EDO"}]
+    """
+    out = []
+    if raw is None:
+        return out
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            k2 = norm_str(k)
+            v2 = "" if v is None else norm_str(v)
+            out.append(f"{k2}={v2}")
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                for k, v in item.items():
+                    k2 = norm_str(k)
+                    v2 = "" if v is None else norm_str(v)
+                    out.append(f"{k2}={v2}")
+            else:
+                out.append(norm_str(item))
+    else:
+        out.append(norm_str(raw))
+    # dedupe while preserving order
+    seen = set()
+    dedup = []
+    for t in out:
+        if t not in seen:
+            seen.add(t)
+            dedup.append(t)
+    return dedup
+
+def extract_metadata(doc: Any) -> Dict[str, Any]:
+    name = find_first(doc, FIELD_PATHS["name"])
+    ident = find_first(doc, FIELD_PATHS["identifier"])
+    tags = find_first(doc, FIELD_PATHS["tags"])
+    return {
+        "name": norm_str(name),
+        "identifier": norm_str(ident),
+        "tags": normalize_tags(tags),
+    }
+
+def tags_match(tags_a: List[str], tags_b: List[str]) -> Tuple[bool, Dict[str, Any]]:
+    set_a, set_b = set(tags_a), set(tags_b)
+    inter = sorted(list(set_a & set_b))
+    if TAGS_REQUIRED and (not set_a or not set_b):
+        return (False, {"reason": "tags_required_missing", "shared": []})
+    if TAGS_MATCH_MODE == "any":
+        return (len(inter) >= 1, {"shared": inter})
+    if TAGS_MATCH_MODE == "min":
+        return (len(inter) >= TAGS_INTERSECT_MIN, {"shared": inter})
+    if TAGS_MATCH_MODE == "subset":
+        ok = set_a.issubset(set_b) or set_b.issubset(set_a)
+        return (ok, {"shared": inter})
+    if TAGS_MATCH_MODE == "exact":
+        ok = set_a == set_b
+        return (ok, {"shared": inter})
+    # default fallback = any
+    return (len(inter) >= 1, {"shared": inter})
+
+def metadata_match(meta_a: Dict[str, Any], meta_b: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    reasons = []
+    # name
+    if REQUIRE_SAME_NAME:
+        if not (meta_a["name"] and meta_b["name"] and meta_a["name"] == meta_b["name"]):
+            return (False, {"reason": "name_mismatch", "a": meta_a["name"], "b": meta_b["name"]})
+        reasons.append("name_eq")
+    # identifier
+    if REQUIRE_SAME_IDENTIFIER:
+        if not (meta_a["identifier"] and meta_b["identifier"] and meta_a["identifier"] == meta_b["identifier"]):
+            return (False, {"reason": "identifier_mismatch", "a": meta_a["identifier"], "b": meta_b["identifier"]})
+        reasons.append("identifier_eq")
+    # tags
+    ok, info = tags_match(meta_a["tags"], meta_b["tags"])
+    if not ok:
+        info.setdefault("reason", "tags_mismatch")
+        return (False, info)
+    reasons.append(f"tags_{TAGS_MATCH_MODE}")
+    return (True, {"reason": "metadata_match", "shared_tags": info.get("shared", []), "checks": reasons})
+
 def flatten(obj, path=()):
-    """
-    Flatten dicts/lists into {"a.b[0].c": value, ...} for path-wise equality & similarity.
-    """
     if isinstance(obj, dict):
         for k, v in obj.items():
             yield from flatten(v, path + (str(k),))
@@ -76,18 +214,7 @@ def flatten(obj, path=()):
         key = ".".join(path) if path else "<root>"
         yield (key, obj)
 
-def sane_name(s: str) -> str:
-    """
-    Safe filename from a relative path (keep dot, dash, underscore).
-    """
-    s = s.replace(os.sep, "__")
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", s)
-
-def similarity(flat1: dict, flat2: dict) -> float:
-    """
-    Jaccard-like similarity on exact (path,value) matches.
-    score = |intersection| / |union|
-    """
+def similarity(flat1: Dict[str, Any], flat2: Dict[str, Any]) -> float:
     set1 = set(flat1.items())
     set2 = set(flat2.items())
     if not set1 and not set2:
@@ -103,145 +230,142 @@ def file_sha256(path: str) -> str:
             h.update(chunk)
     return h.hexdigest()
 
-def copy_to_common(src_abs: str, src_rel: str, root_label: str, common_dir: str, preserve_structure: bool):
-    """
-    Copy file into common_dir.
-    - If preserve_structure: common_dir / root_label / src_rel
-    - Else: common_dir / (root_label__sanitized_rel[.yaml])
-    """
-    if preserve_structure:
-        dst = os.path.join(common_dir, root_label, src_rel)
+def sane_name(s: str) -> str:
+    s = s.replace(os.sep, "__")
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", s)
+
+def build_dest(abs_p: str, rel_p: str, root_label: str) -> str:
+    if PRESERVE_STRUCTURE:
+        dst = os.path.join(matching_common_folder, root_label, rel_p)
         ensure_dir(os.path.dirname(dst))
-    else:
-        dst = os.path.join(common_dir, f"{root_label}__{sane_name(src_rel)}")
-        root, ext = os.path.splitext(dst)
-        if not ext:
-            dst = root + ".yaml"
-    shutil.copy2(src_abs, dst)
+        return dst
+    safe = sane_name(rel_p)
+    dst = os.path.join(matching_common_folder, f"{root_label}__{safe}")
+    root, ext = os.path.splitext(dst)
+    if not ext:
+        dst = root + ".yaml"
     return dst
 
-
-# ---------- main ----------
-
+# ================= main =================
 def main():
     if not input_dirs or len(input_dirs) < 2:
         print("Provide at least two input directories in 'input_dirs'.")
         return
 
     ensure_dir(matching_common_folder)
-
-    if CLEAN_DEST and os.path.isdir(matching_common_folder):
-        # Remove everything inside common_dir (but keep the folder)
+    if CLEAN_DEST:
         for root, dirs, files in os.walk(matching_common_folder, topdown=False):
             for name in files:
-                try:
-                    os.remove(os.path.join(root, name))
-                except Exception:
-                    pass
+                try: os.remove(os.path.join(root, name))
+                except Exception: pass
             for name in dirs:
-                try:
-                    os.rmdir(os.path.join(root, name))
-                except Exception:
-                    pass
+                try: os.rmdir(os.path.join(root, name))
+                except Exception: pass
 
-    # Gather files across all roots: (root_idx, root_label, root_path, abs_path, rel_path)
-    all_files = []
+    # Collect files across roots
+    all_files: List[Tuple[int, str, str, str, str]] = []  # (root_idx, label, root, abs, rel)
     for idx, root in enumerate(input_dirs):
         label = os.path.basename(os.path.normpath(root)) or f"root{idx+1}"
         for abs_p, rel_p in list_yaml_files_recursively(root):
             all_files.append((idx, label, root, abs_p, rel_p))
-
     if len(all_files) < 2:
-        print("Need at least two YAML files across the given input directories.")
+        print("No YAML files found.")
         return
 
-    # Build comparison pairs
-    if MATCH_BY_NAME:
+    # Build pairs
+    pairs = []
+    if MATCH_BY_FILENAME:
         from collections import defaultdict
         groups = defaultdict(list)
-        for entry in all_files:
-            idx, label, root, abs_p, rel_p = entry
-            groups[os.path.basename(rel_p)].append(entry)
-        pairs = []
+        for item in all_files:
+            groups[os.path.basename(item[4])].append(item)
         for _, items in groups.items():
             for i in range(len(items)):
                 for j in range(i + 1, len(items)):
-                    a = items[i]; b = items[j]
+                    a, b = items[i], items[j]
                     if not INCLUDE_INTRA_ROOT and a[0] == b[0]:
                         continue
                     pairs.append((a, b))
     else:
-        pairs = []
         for i in range(len(all_files)):
             for j in range(i + 1, len(all_files)):
-                a = all_files[i]; b = all_files[j]
+                a, b = all_files[i], all_files[j]
                 if not INCLUDE_INTRA_ROOT and a[0] == b[0]:
                     continue
                 pairs.append((a, b))
-
     if not pairs:
-        print("No file pairs to compare (check MATCH_BY_NAME / INCLUDE_INTRA_ROOT).")
+        print("No pairs to compare (check flags).")
         return
 
-    # Compare & collect matches + common values
-    matched_paths = set()     # abs paths that matched at least one file
+    # Prepare index
     index_by_abs = {e[3]: e for e in all_files}
-    common_values_report = []  # list of dicts per matched pair
 
+    # Run comparisons with metadata-first match
+    matched_paths = set()
+    report_pairs = []
     total_pairs = 0
-    matched_pairs = 0
 
     for A, B in pairs:
         total_pairs += 1
         idxA, labelA, rootA, pathA, relA = A
         idxB, labelB, rootB, pathB, relB = B
+
         try:
             d1 = load_first_yaml_doc(pathA) or {}
             d2 = load_first_yaml_doc(pathB) or {}
         except Exception:
-            continue  # skip unreadable YAMLs
+            continue
 
-        diff = DeepDiff(d1, d2, ignore_order=True)
+        metaA = extract_metadata(d1)
+        metaB = extract_metadata(d2)
 
-        sim = None
-        if MATCH_MODE == "exact":
-            is_match = (not diff)
-        else:
-            flat1 = dict(flatten(d1))
-            flat2 = dict(flatten(d2))
-            sim = similarity(flat1, flat2)
-            is_match = (sim >= SIMILARITY_THRESHOLD)
+        # Metadata-based match
+        meta_ok, meta_info = metadata_match(metaA, metaB)
+        if not meta_ok:
+            continue
 
-        if is_match:
-            matched_pairs += 1
-            matched_paths.add(pathA)
-            matched_paths.add(pathB)
+        content_ok = True
+        content_detail = {"mode": "none"}
+        if ENABLE_CONTENT_CHECK:
+            if CONTENT_MODE == "exact":
+                from deepdiff import DeepDiff
+                diff = DeepDiff(d1, d2, ignore_order=True)
+                content_ok = (not diff)
+                content_detail = {"mode": "exact", "equal": content_ok}
+            else:
+                flat1 = dict(flatten(d1))
+                flat2 = dict(flatten(d2))
+                sim = similarity(flat1, flat2)
+                content_ok = (sim >= SIMILARITY_THRESHOLD)
+                content_detail = {"mode": "threshold", "similarity": round(sim, 4), "threshold": SIMILARITY_THRESHOLD}
 
-            # Compute common values (by full key path)
-            flat1 = dict(flatten(d1))
-            flat2 = dict(flatten(d2))
-            commons = [{"path": k, "value": flat1[k]}
-                       for k in sorted(set(flat1.keys()) & set(flat2.keys()))
-                       if flat1[k] == flat2[k]]
+        if not content_ok:
+            continue
 
-            # Trim to keep the report small (configurable)
-            commons_trimmed = commons[:MAX_COMMON_VALUES_PER_PAIR]
+        # record as matched
+        matched_paths.add(pathA)
+        matched_paths.add(pathB)
 
-            if WRITE_COMMON_VALUES_REPORT:
-                common_values_report.append({
-                    "fileA": {"root": labelA, "rel": relA},
-                    "fileB": {"root": labelB, "rel": relB},
-                    "mode": MATCH_MODE,
-                    "similarity": None if sim is None else round(sim, 4),
-                    "common_count": len(commons),
-                    "common_values_sampled": commons_trimmed
-                })
+        # sample common keys/values (not huge)
+        flat1 = dict(flatten(d1))
+        flat2 = dict(flatten(d2))
+        common_keys = [k for k in flat1.keys() if k in flat2 and flat1[k] == flat2[k]]
+        common_sample = [{"path": k, "value": flat1[k]} for k in sorted(common_keys)[:MAX_COMMON_SAMPLED]]
 
-    # Copy unique matched files to the common folder (dedupe by file content)
+        report_pairs.append({
+            "fileA": {"root": labelA, "rel": relA, "name": metaA["name"], "identifier": metaA["identifier"], "tags_count": len(metaA["tags"])},
+            "fileB": {"root": labelB, "rel": relB, "name": metaB["name"], "identifier": metaB["identifier"], "tags_count": len(metaB["tags"])},
+            "shared_tags": meta_info.get("shared_tags", []),
+            "checks": meta_info.get("checks", []),
+            "content_check": content_detail,
+            "common_values_sampled": common_sample,
+        })
+
+    # Copy unique matched files (dedupe by file content hash)
     copied = 0
     seen_hashes = set()
     for abs_p in sorted(matched_paths):
-        idx, label, root, _, rel = index_by_abs[abs_p]
+        _, label, _, _, rel = index_by_abs[abs_p]
         try:
             h = file_sha256(abs_p)
         except Exception:
@@ -249,43 +373,46 @@ def main():
         if h in seen_hashes:
             continue
         seen_hashes.add(h)
-        copy_to_common(abs_p, rel, label, matching_common_folder, PRESERVE_STRUCTURE)
+        dst = build_dest(abs_p, rel, label)
+        ensure_dir(os.path.dirname(dst))
+        shutil.copy2(abs_p, dst)
         copied += 1
 
-    # Write common values report (single YAML)
-    if WRITE_COMMON_VALUES_REPORT:
-        try:
-            report = {
-                "config": {
-                    "match_mode": MATCH_MODE,
-                    "similarity_threshold": SIMILARITY_THRESHOLD if MATCH_MODE == "threshold" else None,
-                    "match_by_name": MATCH_BY_NAME,
-                    "preserve_structure": PRESERVE_STRUCTURE,
-                    "include_intra_root": INCLUDE_INTRA_ROOT,
-                    "max_common_values_per_pair": MAX_COMMON_VALUES_PER_PAIR,
-                },
-                "stats": {
-                    "input_roots": len(input_dirs),
-                    "yaml_files_discovered": len(all_files),
-                    "pairs_compared": total_pairs,
-                    "matching_pairs": matched_pairs,
-                    "unique_files_copied": copied
-                },
-                "pairs": common_values_report
-            }
-            report_path = os.path.join(matching_common_folder, COMMON_VALUES_REPORT_NAME)
-            with open(report_path, "w", encoding="utf-8") as f:
-                yaml.safe_dump(report, f, sort_keys=False, allow_unicode=True)
-            print(f"Common values report (YAML) written to: {report_path}")
-        except Exception as e:
-            print(f"Failed to write YAML report: {e}")
+    # Write YAML report
+    report = {
+        "config": {
+            "require_same_name": REQUIRE_SAME_NAME,
+            "require_same_identifier": REQUIRE_SAME_IDENTIFIER,
+            "tags_match_mode": TAGS_MATCH_MODE,
+            "tags_intersect_min": TAGS_INTERSECT_MIN,
+            "tags_required": TAGS_REQUIRED,
+            "case_insensitive": CASE_INSENSITIVE_COMPARE,
+            "field_paths": FIELD_PATHS,
+            "match_by_filename": MATCH_BY_FILENAME,
+            "preserve_structure": PRESERVE_STRUCTURE,
+            "include_intra_root": INCLUDE_INTRA_ROOT,
+            "enable_content_check": ENABLE_CONTENT_CHECK,
+            "content_mode": CONTENT_MODE if ENABLE_CONTENT_CHECK else "none",
+            "similarity_threshold": SIMILARITY_THRESHOLD if ENABLE_CONTENT_CHECK and CONTENT_MODE == "threshold" else None,
+            "max_common_sampled": MAX_COMMON_SAMPLED,
+        },
+        "stats": {
+            "input_roots": len(input_dirs),
+            "yaml_files_discovered": len(all_files),
+            "pairs_compared": total_pairs,
+            "unique_files_copied": copied,
+        },
+        "pairs": report_pairs,
+    }
+    ensure_dir(matching_common_folder)
+    report_path = os.path.join(matching_common_folder, REPORT_NAME)
+    with open(report_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(report, f, sort_keys=False, allow_unicode=True)
 
     print("Done.")
-    print(f"  Input roots           : {len(input_dirs)}")
-    print(f"  YAML files discovered : {len(all_files)}")
     print(f"  Pairs compared        : {total_pairs}")
-    print(f"  Matching pairs        : {matched_pairs}")
     print(f"  Unique files copied   : {copied} -> {matching_common_folder}")
+    print(f"  Report                : {report_path}")
 
 
 if __name__ == "__main__":
