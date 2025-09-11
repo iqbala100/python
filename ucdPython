@@ -1,46 +1,21 @@
-
-#!/usr/bin/env python3
-"""
-Recursive YAML comparer
-- Compares every YAML pair under an input directory (structure-aware via DeepDiff).
-- Writes pairwise reports (matching values & differences) to an output reports directory.
-- Copies "matching" files to a common folder (either exact match or similarity threshold).
-
-Usage (Windows example):
-    python compare_yaml_recursive.py ^
-        --input-dir "C:\path\to\yaml_root" ^
-        --reports-dir "C:\path\to\yaml_diffs_recursive" ^
-        --common-dir "C:\path\to\yaml_matching_common" ^
-        --match-mode exact
-
-Or with similarity threshold (0..1):
-    python compare_yaml_recursive.py --match-mode threshold --threshold 0.9
-
-Notes:
-- "Exact" means DeepDiff finds no difference (ignore_order=True).
-- "Threshold" uses a Jaccard-like similarity on identical (path,value) pairs of flattened YAMLs.
-- By default, matched files are copied as flat, safe filenames (path encoded). To preserve
-  original subfolder structure under the common folder, pass --preserve-structure.
-"""
-
-import argparse
 import os
 import re
 import shutil
-import sys
-from typing import Dict, Iterable, Tuple
+import yaml
+from deepdiff import DeepDiff
 
-try:
-    import yaml
-except Exception as e:
-    print("Missing dependency: pyyaml. Install with: pip install pyyaml", file=sys.stderr)
-    raise
+# === Configure paths (use raw strings r"" on Windows) ===
+input_dir               = r"C:\Users\iqahmad\Desktop\RFP\GitHubRepo\ucd-to-harness1\harness_out_RG1\.harness\services"
+pair_reports_dir        = r"C:\Users\iqahmad\Desktop\RFP\GitHubRepo\ucd-to-harness1\yaml_diffs_recursive"
+matching_common_folder  = r"C:\Users\iqahmad\Desktop\RFP\GitHubRepo\ucd-to-harness1\yaml_matching_common"
 
-try:
-    from deepdiff import DeepDiff
-except Exception as e:
-    print("Missing dependency: deepdiff. Install with: pip install deepdiff", file=sys.stderr)
-    raise
+# === Matching strategy ===
+# "exact": copy files only when YAMLs are identical (DeepDiff == empty, ignore_order=True)
+# "threshold": use similarity of flattened keypaths & values
+MATCH_MODE = "exact"          # choose: "exact" or "threshold"
+SIMILARITY_THRESHOLD = 0.90   # used only when MATCH_MODE == "threshold"
+
+# ---------- helpers ----------
 
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
@@ -83,7 +58,7 @@ def sane_name(s: str) -> str:
     s = s.replace(os.sep, "__")
     return re.sub(r"[^A-Za-z0-9._-]+", "_", s)
 
-def similarity(flat1: Dict[str, object], flat2: Dict[str, object]) -> float:
+def similarity(flat1: dict, flat2: dict) -> float:
     """
     Jaccard-like similarity on exact (path,value) matches.
     score = |intersection| / |union|
@@ -96,147 +71,92 @@ def similarity(flat1: Dict[str, object], flat2: Dict[str, object]) -> float:
     inter = set1 & set2
     return len(inter) / len(union) if union else 0.0
 
-def copy_matched_file(src: str, input_root: str, common_dir: str, preserve_structure: bool):
-    rel = os.path.relpath(src, input_root)
-    if preserve_structure:
-        dst = os.path.join(common_dir, rel)
-        ensure_dir(os.path.dirname(dst))
-    else:
-        safe = sane_name(rel)
-        dst = os.path.join(common_dir, safe)
-        # Preserve extension; if missing, default to .yaml
-        root, ext = os.path.splitext(dst)
-        if not ext:
-            dst = root + ".yaml"
-    shutil.copy2(src, dst)
+# ---------- main ----------
 
 def main():
-    parser = argparse.ArgumentParser(description="Recursive YAML comparer with report & matching-collector.")
-    parser.add_argument("--input-dir", required=True, help="Root directory containing YAML files (recursively).")
-    parser.add_argument("--reports-dir", required=True, help="Directory to write pairwise comparison reports.")
-    parser.add_argument("--common-dir", required=True, help="Directory to copy YAML files that are considered 'matching'.")
-    parser.add_argument("--match-mode", choices=["exact", "threshold"], default="exact",
-                        help="Matching strategy: 'exact' (identical) or 'threshold' (similarity >= threshold).")
-    parser.add_argument("--threshold", type=float, default=0.90,
-                        help="Similarity threshold in [0,1]. Used only when --match-mode=threshold.")
-    parser.add_argument("--preserve-structure", action="store_true",
-                        help="Preserve the input subfolder structure under the common folder.")
-    parser.add_argument("--match-by-name", action="store_true",
-                        help="Only compare files with the same base filename (reduces pair explosion).")
-
-    args = parser.parse_args()
-
-    input_dir       = args.input_dir
-    pair_reports    = args.reports_dir
-    common_folder   = args.common_dir
-    match_mode      = args.match_mode
-    threshold       = args.threshold
-    preserve_struct = args.preserve_structure
-    match_by_name   = args.match_by_name
-
-    ensure_dir(pair_reports)
-    ensure_dir(common_folder)
+    ensure_dir(pair_reports_dir)
+    ensure_dir(matching_common_folder)
 
     yaml_files = list_yaml_files_recursively(input_dir)
     if len(yaml_files) < 2:
-        print("Need at least two YAML files under --input-dir to compare.", file=sys.stderr)
-        sys.exit(1)
-
-    # Optional: group by filename to reduce pair counts
-    if match_by_name:
-        from collections import defaultdict
-        groups = defaultdict(list)
-        for abs_path, rel in yaml_files:
-            groups[os.path.basename(rel)].append((abs_path, rel))
-        # Build pairs only within same-name groups
-        pairs = []
-        for name, items in groups.items():
-            for i in range(len(items)):
-                for j in range(i + 1, len(items)):
-                    pairs.append((items[i], items[j]))
-    else:
-        # All pairs
-        pairs = []
-        for i in range(len(yaml_files)):
-            for j in range(i + 1, len(yaml_files)):
-                pairs.append((yaml_files[i], yaml_files[j]))
+        print("Need at least two YAML files under input_dir to compare.")
+        return
 
     files_to_copy = set()
     total_pairs = 0
     written_reports = 0
     matched_pairs = 0
 
-    for (path1, rel1), (path2, rel2) in pairs:
-        total_pairs += 1
-        try:
+    for i in range(len(yaml_files)):
+        for j in range(i + 1, len(yaml_files)):
+            total_pairs += 1
+            path1, rel1 = yaml_files[i]
+            path2, rel2 = yaml_files[j]
+
             data1 = load_first_yaml_doc(path1) or {}
             data2 = load_first_yaml_doc(path2) or {}
-        except Exception as e:
-            # Write an error report and continue
-            out_name = f"ERROR_{sane_name(rel1)}_vs_{sane_name(rel2)}.txt"
-            out_path = os.path.join(pair_reports, out_name)
+
+            # Deep diff (structure-aware; ignores list order)
+            diff = DeepDiff(data1, data2, ignore_order=True)
+
+            # Matching by mode
+            flat1 = dict(flatten(data1))
+            flat2 = dict(flatten(data2))
+            matches = {k: v for k, v in flat1.items() if k in flat2 and flat2[k] == v}
+            sim = similarity(flat1, flat2)
+
+            if MATCH_MODE == "exact":
+                is_match = (not diff)  # exact structural match
+            else:  # threshold mode
+                is_match = (sim >= SIMILARITY_THRESHOLD)
+
+            if is_match:
+                matched_pairs += 1
+                files_to_copy.add(path1)
+                files_to_copy.add(path2)
+
+            # Write pair report
+            out_name = f"compare_{sane_name(rel1)}_vs_{sane_name(rel2)}.txt"
+            out_path = os.path.join(pair_reports_dir, out_name)
             with open(out_path, "w", encoding="utf-8") as f:
-                f.write("=== YAML Comparison ERROR ===\n")
+                f.write("=== YAML Comparison ===\n")
                 f.write(f"File A: {rel1}\n")
                 f.write(f"File B: {rel2}\n")
-                f.write(f"Error: {e}\n")
+                f.write(f"Match mode: {MATCH_MODE}\n")
+                if MATCH_MODE == "threshold":
+                    f.write(f"Similarity: {sim:.3f}  (threshold={SIMILARITY_THRESHOLD:.2f})\n")
+                f.write(f"Pair considered MATCH: {is_match}\n\n")
+
+                f.write("✅ Matching values (same path & value):\n")
+                if matches:
+                    for k in sorted(matches):
+                        f.write(f"  {k}: {matches[k]!r}\n")
+                else:
+                    f.write("  (none)\n")
+
+                f.write("\n❌ Differences (DeepDiff, ignore_order=True):\n")
+                if diff:
+                    f.write(str(diff) + "\n")
+                else:
+                    f.write("  (none)\n")
+
             written_reports += 1
-            continue
 
-        # Structure-aware diff (ignoring list order)
-        diff = DeepDiff(data1, data2, ignore_order=True)
-
-        # Matching by mode
-        flat1 = dict(flatten(data1))
-        flat2 = dict(flatten(data2))
-        matches = {k: v for k, v in flat1.items() if k in flat2 and flat2[k] == v}
-        sim = similarity(flat1, flat2)
-
-        if match_mode == "exact":
-            is_match = (not diff)
-        else:
-            is_match = (sim >= threshold)
-
-        if is_match:
-            matched_pairs += 1
-            files_to_copy.add(path1)
-            files_to_copy.add(path2)
-
-        # Write pair report
-        out_name = f"compare_{sane_name(rel1)}_vs_{sane_name(rel2)}.txt"
-        out_path = os.path.join(pair_reports, out_name)
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write("=== YAML Comparison ===\n")
-            f.write(f"File A: {rel1}\n")
-            f.write(f"File B: {rel2}\n")
-            f.write(f"Match mode: {match_mode}\n")
-            if match_mode == "threshold":
-                f.write(f"Similarity: {sim:.3f}  (threshold={threshold:.2f})\n")
-            f.write(f"Pair considered MATCH: {is_match}\n\n")
-
-            f.write("✅ Matching values (same path & value):\n")
-            if matches:
-                for k in sorted(matches):
-                    f.write(f"  {k}: {matches[k]!r}\n")
-            else:
-                f.write("  (none)\n")
-
-            f.write("\n❌ Differences (DeepDiff, ignore_order=True):\n")
-            if diff:
-                f.write(str(diff) + "\n")
-            else:
-                f.write("  (none)\n")
-        written_reports += 1
-
-    # Copy unique matched files
+    # Copy unique matched files to the common folder (avoid overwrites with safe names)
     copied = 0
     for src in sorted(files_to_copy):
-        copy_matched_file(src, input_dir, common_folder, preserve_struct)
+        rel = os.path.relpath(src, input_dir)
+        safe = sane_name(rel)
+        dst = os.path.join(matching_common_folder, safe)
+        # Preserve extension; if missing, default to .yaml
+        if not os.path.splitext(dst)[1]:
+            dst += ".yaml"
+        shutil.copy2(src, dst)
         copied += 1
 
-    print(f"Done.\n  Compared pairs: {total_pairs}\n  Reports written: {written_reports} -> {pair_reports}")
+    print(f"Done.\n  Compared pairs: {total_pairs}\n  Reports written: {written_reports} -> {pair_reports_dir}")
     print(f"  Matching pairs: {matched_pairs}")
-    print(f"  Unique files copied to common folder: {copied} -> {common_folder}")
+    print(f"  Unique files copied to common folder: {copied} -> {matching_common_folder}")
 
 if __name__ == "__main__":
     main()
