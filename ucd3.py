@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import shutil
 import hashlib
 import yaml
@@ -33,9 +32,9 @@ CLEAN_DEST = False
 # Compare files within the same input root as well (default compares only across different roots)
 INCLUDE_INTRA_ROOT = False
 
-# Write a single JSON with pairwise common values for matched pairs
+# Write a single YAML with pairwise common values for matched pairs
 WRITE_COMMON_VALUES_REPORT = True
-COMMON_VALUES_REPORT_NAME = "common_values_report.json"
+COMMON_VALUES_REPORT_NAME = "common_values_report.yaml"
 # Limit the number of common entries stored per pair (to keep report manageable)
 MAX_COMMON_VALUES_PER_PAIR = 200
 
@@ -221,7 +220,7 @@ def main():
             # Compute common values (by full key path)
             flat1 = dict(flatten(d1))
             flat2 = dict(flatten(d2))
-            commons = [{ "path": k, "value": flat1[k] }
+            commons = [{"path": k, "value": flat1[k]}
                        for k in sorted(set(flat1.keys()) & set(flat2.keys()))
                        if flat1[k] == flat2[k]]
 
@@ -253,32 +252,33 @@ def main():
         copy_to_common(abs_p, rel, label, matching_common_folder, PRESERVE_STRUCTURE)
         copied += 1
 
-    # Write common values report (single JSON)
+    # Write common values report (single YAML)
     if WRITE_COMMON_VALUES_REPORT:
         try:
+            report = {
+                "config": {
+                    "match_mode": MATCH_MODE,
+                    "similarity_threshold": SIMILARITY_THRESHOLD if MATCH_MODE == "threshold" else None,
+                    "match_by_name": MATCH_BY_NAME,
+                    "preserve_structure": PRESERVE_STRUCTURE,
+                    "include_intra_root": INCLUDE_INTRA_ROOT,
+                    "max_common_values_per_pair": MAX_COMMON_VALUES_PER_PAIR,
+                },
+                "stats": {
+                    "input_roots": len(input_dirs),
+                    "yaml_files_discovered": len(all_files),
+                    "pairs_compared": total_pairs,
+                    "matching_pairs": matched_pairs,
+                    "unique_files_copied": copied
+                },
+                "pairs": common_values_report
+            }
             report_path = os.path.join(matching_common_folder, COMMON_VALUES_REPORT_NAME)
             with open(report_path, "w", encoding="utf-8") as f:
-                json.dump({
-                    "config": {
-                        "match_mode": MATCH_MODE,
-                        "similarity_threshold": SIMILARITY_THRESHOLD if MATCH_MODE == "threshold" else None,
-                        "match_by_name": MATCH_BY_NAME,
-                        "preserve_structure": PRESERVE_STRUCTURE,
-                        "include_intra_root": INCLUDE_INTRA_ROOT,
-                        "max_common_values_per_pair": MAX_COMMON_VALUES_PER_PAIR,
-                    },
-                    "stats": {
-                        "input_roots": len(input_dirs),
-                        "yaml_files_discovered": len(all_files),
-                        "pairs_compared": total_pairs,
-                        "matching_pairs": matched_pairs,
-                        "unique_files_copied": copied
-                    },
-                    "pairs": common_values_report
-                }, f, indent=2, ensure_ascii=False)
-            print(f"Common values report written to: {report_path}")
+                yaml.safe_dump(report, f, sort_keys=False, allow_unicode=True)
+            print(f"Common values report (YAML) written to: {report_path}")
         except Exception as e:
-            print(f"Failed to write common values report: {e}")
+            print(f"Failed to write YAML report: {e}")
 
     print("Done.")
     print(f"  Input roots           : {len(input_dirs)}")
@@ -286,3 +286,7 @@ def main():
     print(f"  Pairs compared        : {total_pairs}")
     print(f"  Matching pairs        : {matched_pairs}")
     print(f"  Unique files copied   : {copied} -> {matching_common_folder}")
+
+
+if __name__ == "__main__":
+    main()
