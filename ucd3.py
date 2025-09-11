@@ -8,13 +8,17 @@ from typing import Any, Dict, List, Tuple, Optional
 # ========== CONFIG ==========
 # Multiple input roots to scan recursively
 input_dirs = [
-    r"C:\path\to\envA\.harness\services",
-    r"C:\path\to\envB\.harness\services",
+    r"C:\Users\iqahmad\Desktop\RFP\GitHubRepo\ucd-to-harness1\harness_out_RG1\.harness\services",
+    r"C:\Users\iqahmad\Desktop\RFP\GitHubRepo\ucd-to-harness1\harness_out_RG2\.harness\services",
+    r"C:\Users\iqahmad\Desktop\RFP\GitHubRepo\ucd-to-harness1\harness_out_RG3\.harness\services",
+    r"C:\Users\iqahmad\Desktop\RFP\GitHubRepo\ucd-to-harness1\harness_out_RG4\.harness\services",
+    r"C:\Users\iqahmad\Desktop\RFP\GitHubRepo\ucd-to-harness1\harness_out_RG5\.harness\services",
+    r"C:\Users\iqahmad\Desktop\RFP\GitHubRepo\ucd-to-harness1\harness_out_RG6\.harness\services",
     # add more roots if needed...
 ]
 
 # Single destination for matched files + report
-matching_common_folder = r"C:\path\to\yaml_matching_common"
+matching_common_folder = r"C:\Users\iqahmad\Desktop\RFP\GitHubRepo\ucd-to-harness1\yaml_matching_common"
 
 # --- Metadata match rules (PRIMARY) ---
 REQUIRE_SAME_NAME = True          # require YAML 'name' equality
